@@ -1,0 +1,6 @@
+@AuthAPI_HostAddress = http://localhost:5070
+
+GET {{AuthAPI_HostAddress}}/api/test/test-db
+Accept: application/json
+
+###

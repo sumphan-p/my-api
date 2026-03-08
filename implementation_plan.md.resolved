@@ -1,0 +1,189 @@
+# Centralized Auth Server — AuthAPI (v7)
+
+ASP.NET Core .NET 10 — Identity Provider สำหรับ API อื่นมาใช้งาน  
+Project: **AuthAPI** · Database: **AuthDB** · ทดสอบผ่าน Swagger UI
+
+---
+
+## Architecture
+
+```
+               Auth Server (AuthAPI)
+                      │
+       ┌──────────────┼──────────────┐
+       ▼              ▼              ▼
+[Inventory API] [Order API]    [Other API]
+ ตรวจ JWT ด้วย   เรียก          ตรวจ JWT
+ Public Key     /introspect    ด้วย Public Key
+```
+
+> [!IMPORTANT]
+> **RS256**: เซ็น JWT ด้วย **Private Key** — API อื่นตรวจด้วย **Public Key** เท่านั้น
+
+---
+
+## Proposed Changes
+
+### 1. Database Migration
+
+#### [NEW] `database/migration_v2.sql`
+
+```sql
+USE [AuthDB];
+
+ALTER TABLE Users ADD
+    Email                NVARCHAR(255) NULL UNIQUE,
+    Role                 NVARCHAR(50)  NOT NULL DEFAULT 'user',
+    LoginAttempts        INT           NOT NULL DEFAULT 0,
+    LockedUntil          DATETIME2     NULL,
+    PasswordResetToken   NVARCHAR(500) NULL,
+    PasswordResetExpires DATETIME2     NULL;
+
+CREATE TABLE Clients (
+    Id           INT IDENTITY(1,1) PRIMARY KEY,
+    ClientId     NVARCHAR(100) NOT NULL UNIQUE,
+    ClientSecret NVARCHAR(500) NOT NULL,
+    Name         NVARCHAR(200) NOT NULL,
+    IsActive     BIT NOT NULL DEFAULT 1,
+    CreatedAt    DATETIME2 NOT NULL DEFAULT GETDATE()
+);
+```
+
+---
+
+### 2. NuGet Packages
+
+#### [MODIFY] [AuthAPI.csproj](file:///d:/_dev/_2026_workshop/_claude_api/my-api/AuthAPI.csproj)
+```xml
+<PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
+<PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.x" />
+```
+
+---
+
+### 3. RSA Key Setup (ทำครั้งเดียว)
+
+```bash
+openssl genrsa -out private.pem 2048
+openssl rsa -in private.pem -pubout -out public.pem
+
+dotnet user-secrets set "Jwt:PrivateKey" "<base64-private-pem>"
+dotnet user-secrets set "Email:Username" "samphan.paw@king-pac.com"
+dotnet user-secrets set "Email:Password" "51522515"
+```
+
+---
+
+### 4. Models & DTOs
+
+#### [NEW] `Models/User.cs` · `Models/Client.cs` · `Models/RefreshToken.cs`
+#### [NEW] `Models/AuthDtos.cs`
+```
+LoginRequest        { Username, Password }
+LoginResponse       { AccessToken, ExpiresIn }
+RegisterRequest     { Username, Email, Password, ConfirmPassword }
+ChangePasswordReq   { CurrentPassword, NewPassword, ConfirmNewPassword }
+ForgotPasswordReq   { Email }
+ResetPasswordReq    { Token, NewPassword, ConfirmNewPassword }
+MeResponse          { Id, Username, Email, Role }
+IntrospectRequest   { Token }
+IntrospectResponse  { Active, Sub, Username, Email, Role, Exp }
+```
+
+---
+
+### 5. Services
+
+#### [NEW] `Services/JwtService.cs`
+- RS256 — Private Key จาก User Secrets
+- `GenerateAccessToken(User)` → JWT 15 นาที (sub, username, email, role)
+- `GenerateRefreshToken()` → 64 bytes random
+- `GenerateResetToken()` → 32 bytes hex
+- `ValidateToken(token)` → ClaimsPrincipal
+- `GetJwks()` → JWKS JSON (Public Key)
+
+#### [NEW] `Services/EmailService.cs`
+- SMTP: `mail.king-pac.com:587`
+- `SendPasswordResetEmailAsync(to, token, username)`
+
+#### [NEW] `Services/TokenCleanupService.cs`
+- Background job ทุก 24 ชม. — ลบ token หมดอายุ/revoked
+
+---
+
+### 6. Controllers
+
+#### [NEW] `Controllers/AuthController.cs`
+
+| Method | Route | Feature | Auth |
+|---|---|---|---|
+| POST | `/api/auth/register` | สมัครสมาชิก | Public |
+| POST | `/api/auth/login` | Login → JWT + Refresh Cookie | Public |
+| POST | `/api/auth/refresh` | Rotate Refresh Token | Cookie |
+| POST | `/api/auth/logout` | Revoke + clear cookie | Public |
+| GET  | `/api/auth/me` | ข้อมูล user | `[Authorize]` |
+| POST | `/api/auth/change-password` | เปลี่ยน password | `[Authorize]` |
+| POST | `/api/auth/forgot-password` | ส่ง reset email | Public |
+| POST | `/api/auth/reset-password` | Reset ด้วย token | Public |
+| POST | `/api/auth/introspect` | ตรวจ JWT แทน API อื่น | Client Auth |
+
+**Cookie:** `HttpOnly=true, Secure=true, SameSite=Strict, Expires=+7days`
+
+#### [NEW] `Controllers/WellKnownController.cs`
+- `GET /.well-known/jwks.json` → Public Key
+
+#### [NEW] `Controllers/ClientsController.cs`
+- CRUD `/api/clients` — `[Authorize(Role="admin")]`
+
+---
+
+### 7. Program.cs
+
+#### [MODIFY] [Program.cs](file:///d:/_dev/_2026_workshop/_claude_api/my-api/Program.cs)
+```
+AddAuthentication().AddJwtBearer(RS256)
+AddAuthorization()  — role-based policy
+AddCors()           — multiple origins, AllowCredentials
+AddRateLimiter()    — 5 req/min บน /login, /forgot-password
+AddScoped<IJwtService, JwtService>()
+AddScoped<IEmailService, SmtpEmailService>()
+AddHostedService<TokenCleanupService>()
+
+Middleware: UseCors → UseAuthentication → UseAuthorization → UseRateLimiter
+```
+
+---
+
+### 8. appsettings.json
+
+#### [MODIFY] [appsettings.json](file:///d:/_dev/_2026_workshop/_claude_api/my-api/appsettings.json)
+```json
+"Jwt": {
+  "Issuer": "auth.king-pac.com",
+  "Audience": "king-pac-apps",
+  "AccessTokenExpiryMinutes": 15,
+  "RefreshTokenExpiryDays": 7
+},
+"Email": {
+  "Host": "mail.king-pac.com",
+  "Port": 587,
+  "FromAddress": "noreply@king-pac.com"
+}
+```
+
+> [!WARNING]
+> Secrets ใช้ User Secrets (dev) / Environment Variables (prod) เท่านั้น
+
+---
+
+## Verification Plan (Swagger UI)
+1. `GET /.well-known/jwks.json` → JWKS JSON
+2. `POST /register` → 201
+3. `POST /login` → accessToken + cookie
+4. `GET /me` (Bearer) → user info
+5. `POST /change-password` → login ใหม่ได้
+6. `POST /forgot-password` → ตรวจ email
+7. `POST /reset-password` → login ด้วย password ใหม่
+8. `POST /introspect` (ClientId/Secret) → `{ active: true/false }`
+9. Verify JWT ที่ [jwt.io](https://jwt.io) ด้วย Public Key
+10. Login ผิด 5 ครั้ง → 429

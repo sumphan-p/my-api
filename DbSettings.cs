@@ -1,4 +1,4 @@
-namespace my_api;
+namespace AuthAPI;
 
 public class DbSettings
 {
