@@ -13,3 +13,5 @@ app.UseHttpsRedirection();
 app.UseAuthorization();
 app.MapControllers();
 app.Run();
+
+// ทดสอบ by samphan
